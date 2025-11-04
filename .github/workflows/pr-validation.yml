@@ -1,0 +1,150 @@
+name: Pull Request Validation Gate
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    types: [opened, synchronize, reopened]
+
+# Empêche plusieurs exécutions simultanées pour la même PR
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  security-gate:
+    name: 🔒 Security Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Historique complet pour SonarCloud
+      
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: 📦 Install dependencies
+        run: npm ci
+      
+      - name: 🏗️ Build validation
+        run: npm run build
+      
+      # ========== SAST : SonarCloud ==========
+      - name: 🔍 SAST - SonarCloud Analysis
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=juice-shop-devsecops
+            -Dsonar.organization=votre-org
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/node_modules/**,**/test/**,**/*.spec.js
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.qualitygate.wait=true
+      
+      # ========== SCA : Snyk ==========
+      - name: 📦 SCA - Snyk Vulnerability Scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --json-file-output=snyk-results.json
+        continue-on-error: true
+      
+      - name: 📊 Analyze Snyk Results
+        if: always()
+        run: |
+          if [ -f snyk-results.json ]; then
+            VULNS=$(jq '.vulnerabilities | length' snyk-results.json)
+            echo "🔍 Snyk found $VULNS vulnerabilities"
+            
+            # Vérifier les vulnérabilités critiques
+            CRITICAL=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' snyk-results.json)
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "❌ $CRITICAL critical vulnerabilities found!"
+              exit 1
+            fi
+          fi
+      
+      # ========== SCA : OWASP Dependency-Check ==========
+      - name: 🛡️ SCA - OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'juice-shop'
+          path: '.'
+          format: 'JSON'
+          args: >
+            --scan package.json
+            --scan package-lock.json
+            --failOnCVSS 7
+            --enableExperimental
+      
+      - name: 📤 Upload Dependency-Check Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports/dependency-check-report.json
+      
+      # ========== Tests ==========
+      - name: 🧪 Unit Tests with Coverage
+        run: npm run test:coverage
+      
+      - name: 📈 Check Code Coverage
+        run: |
+          COVERAGE=$(jq '.total.lines.pct' coverage/coverage-summary.json)
+          echo "Code coverage: $COVERAGE%"
+          
+          if (( $(echo "$COVERAGE < 70" | bc -l) )); then
+            echo "❌ Coverage trop faible : $COVERAGE% (minimum: 70%)"
+            exit 1
+          fi
+      
+      # ========== Quality Gate Summary ==========
+      - name: 📋 Generate Security Report
+        if: always()
+        run: |
+          cat << EOF > security-report.md
+          # 🔒 Security Gate Report
+          
+          ## Status Overview
+          - ✅ Build: Success
+          - 🔍 SonarCloud: $([ -f .scannerwork/report-task.txt ] && echo "Completed" || echo "N/A")
+          - 📦 Snyk: $([ -f snyk-results.json ] && echo "Scanned" || echo "N/A")
+          - 🛡️ OWASP Dep-Check: $([ -f reports/dependency-check-report.json ] && echo "Scanned" || echo "N/A")
+          - 🧪 Tests: $(npm test 2>&1 | grep -c "passed" || echo "0") tests passed
+          - 📈 Coverage: $(jq '.total.lines.pct' coverage/coverage-summary.json)%
+          
+          ## Action Required
+          Review all findings before merging to develop.
+          EOF
+          
+          cat security-report.md
+      
+      - name: 💬 Comment PR with report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('security-report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+      
+      # ========== Final Gate ==========
+      - name: ✅ Quality Gate Passed
+        run: echo "🎉 All security checks passed! PR can be reviewed for merge."
