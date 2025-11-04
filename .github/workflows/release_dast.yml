@@ -1,0 +1,35 @@
+#!/bin/bash
+# Installation des outils (à exécuter une fois)
+
+# 1. Installer Husky pour gérer les hooks Git
+npm install --save-dev husky
+npx husky install
+npm pkg set scripts.prepare="husky install"
+
+# 2. Installer detect-secrets pour détecter les secrets
+pip install detect-secrets
+
+# 3. Installer ESLint avec plugins sécurité
+npm install --save-dev \
+  eslint \
+  eslint-plugin-security \
+  eslint-plugin-no-secrets
+
+# 4. Créer le hook pre-commit
+npx husky add .husky/pre-commit "npm run pre-commit-check"
+
+# 5. Ajouter les scripts dans package.json
+cat << 'EOF' >> package.json.snippet
+{
+  "scripts": {
+    "pre-commit-check": "npm run check-secrets && npm run lint:security && npm run format:check",
+    "check-secrets": "detect-secrets scan --baseline .secrets.baseline --all-files",
+    "lint:security": "eslint --ext .js,.ts --plugin security --plugin no-secrets .",
+    "format:check": "prettier --check '**/*.{js,ts,json,md}'",
+    "format:fix": "prettier --write '**/*.{js,ts,json,md}'"
+  }
+}
+EOF
+
+echo "✅ Pre-commit hooks installés !"
+echo "📝 Configurez maintenant .eslintrc.security.js"
